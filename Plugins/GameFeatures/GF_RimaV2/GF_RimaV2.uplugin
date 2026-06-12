@@ -22,6 +22,12 @@
 			"LoadingPhase": "Default"
 		}
 	],
+	"Plugins": [
+		{
+			"Name": "ShooterCore",
+			"Enabled": true
+		}
+	],
 	"ExplicitlyLoaded": true,
 	"BuiltInInitialFeatureState": "Active"
 }
