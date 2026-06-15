@@ -9,8 +9,7 @@
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 #include "Engine/OverlapResult.h"
-#include "Abilities/GameplayAbilityTargetTypes.h"
-#include "Kismet/KismetMathLibrary.h"
+#include "Weapons/LyraRangedWeaponInstance.h"
 
 UGA_Rima_PrimaryFire::UGA_Rima_PrimaryFire(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -30,13 +29,18 @@ bool UGA_Rima_PrimaryFire::IsTargetAlly(AActor* Target, AActor* AvatarActor) con
 
 	if (Target == AvatarActor)
 	{
-		// Hitting yourself counts as an ally (self-heal)
 		return true;
 	}
 
 	if (ULyraTeamSubsystem* TeamSubsystem = UWorld::GetSubsystem<ULyraTeamSubsystem>(GetWorld()))
 	{
 		const ELyraTeamComparison Comparison = TeamSubsystem->CompareTeams(AvatarActor, Target);
+
+		UE_LOG(LogTemp, Warning, TEXT("RIMA: CompareTeams(%s, %s) = %d"),
+			*GetNameSafe(AvatarActor),
+			*GetNameSafe(Target),
+			(int32)Comparison);
+
 		return Comparison == ELyraTeamComparison::OnSameTeam;
 	}
 
@@ -53,6 +57,7 @@ void UGA_Rima_PrimaryFire::ApplyEffectToTarget(AActor* Target, bool bTargetIsAll
 	UAbilitySystemComponent* TargetASC = UAbilitySystemBlueprintLibrary::GetAbilitySystemComponent(Target);
 	if (!TargetASC)
 	{
+		UE_LOG(LogTemp, Warning, TEXT("RIMA: No ASC on target %s"), *GetNameSafe(Target));
 		return;
 	}
 
@@ -65,7 +70,14 @@ void UGA_Rima_PrimaryFire::ApplyEffectToTarget(AActor* Target, bool bTargetIsAll
 	TSubclassOf<UGameplayEffect> EffectClass = bTargetIsAlly ? HealEffectClass : DamageEffectClass;
 	const FGameplayTag& SetByCallerTag = bTargetIsAlly ? HealSetByCallerTag : DamageSetByCallerTag;
 
-	if (!EffectClass)
+	UE_LOG(LogTemp, Warning, TEXT("RIMA: Target=%s IsAlly=%d Magnitude=%.1f Effect=%s Tag=%s"),
+		*GetNameSafe(Target),
+		bTargetIsAlly ? 1 : 0,
+		Magnitude,
+		EffectClass ? *EffectClass->GetName() : TEXT("NULL"),
+		*SetByCallerTag.ToString());
+
+	if (!EffectClass || !SetByCallerTag.IsValid())
 	{
 		return;
 	}
@@ -74,15 +86,20 @@ void UGA_Rima_PrimaryFire::ApplyEffectToTarget(AActor* Target, bool bTargetIsAll
 	EffectContext.AddSourceObject(this);
 
 	FGameplayEffectSpecHandle SpecHandle = SourceASC->MakeOutgoingSpec(EffectClass, GetAbilityLevel(), EffectContext);
-	if (SpecHandle.IsValid())
-	{
-		if (SetByCallerTag.IsValid())
-		{
-			SpecHandle.Data->SetSetByCallerMagnitude(SetByCallerTag, Magnitude);
-		}
 
-		SourceASC->ApplyGameplayEffectSpecToTarget(*SpecHandle.Data.Get(), TargetASC);
+	if (!SpecHandle.IsValid())
+	{
+		return;
 	}
+
+	SpecHandle.Data->SetSetByCallerMagnitude(SetByCallerTag, Magnitude);
+
+	const FActiveGameplayEffectHandle ActiveHandle =
+		SourceASC->ApplyGameplayEffectSpecToTarget(*SpecHandle.Data.Get(), TargetASC);
+
+	UE_LOG(LogTemp, Warning, TEXT("RIMA: Applied GE to %s Success=%d"),
+		*GetNameSafe(Target),
+		ActiveHandle.WasSuccessfullyApplied() ? 1 : 0);
 }
 
 void UGA_Rima_PrimaryFire::ProcessChainTargets(AActor* PrimaryTarget, AActor* AvatarActor, const FVector& ImpactPoint, bool bPrimaryTargetIsAlly, float PrimaryMagnitude)
@@ -96,13 +113,15 @@ void UGA_Rima_PrimaryFire::ProcessChainTargets(AActor* PrimaryTarget, AActor* Av
 	const float ChainMagnitude = PrimaryMagnitude * ChainMultiplier;
 
 	TArray<FOverlapResult> Overlaps;
-	FCollisionShape Sphere = FCollisionShape::MakeSphere(ChainRadius);
+	const FCollisionShape Sphere = FCollisionShape::MakeSphere(ChainRadius);
 
 	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RimaChainOverlap), false);
+
 	if (AvatarActor)
 	{
 		QueryParams.AddIgnoredActor(AvatarActor);
 	}
+
 	if (PrimaryTarget)
 	{
 		QueryParams.AddIgnoredActor(PrimaryTarget);
@@ -117,18 +136,31 @@ void UGA_Rima_PrimaryFire::ProcessChainTargets(AActor* PrimaryTarget, AActor* Av
 		QueryParams
 	);
 
+	UE_LOG(LogTemp, Warning, TEXT("RIMA: Chain overlap found %d results"), Overlaps.Num());
+
+	TSet<AActor*> ProcessedActors;
+
 	for (const FOverlapResult& Overlap : Overlaps)
 	{
 		AActor* SecondaryTarget = Overlap.GetActor();
-		if (!SecondaryTarget)
+
+		if (!SecondaryTarget || ProcessedActors.Contains(SecondaryTarget))
+		{
+			continue;
+		}
+
+		ProcessedActors.Add(SecondaryTarget);
+
+		UAbilitySystemComponent* SecondaryASC =
+			UAbilitySystemBlueprintLibrary::GetAbilitySystemComponent(SecondaryTarget);
+
+		if (!SecondaryASC)
 		{
 			continue;
 		}
 
 		const bool bSecondaryIsAlly = IsTargetAlly(SecondaryTarget, AvatarActor);
 
-		// Chain damage only hits secondary enemies if primary was an enemy,
-		// chain heal only hits secondary allies if primary was an ally.
 		if (bSecondaryIsAlly != bPrimaryTargetIsAlly)
 		{
 			continue;
@@ -138,13 +170,12 @@ void UGA_Rima_PrimaryFire::ProcessChainTargets(AActor* PrimaryTarget, AActor* Av
 
 		if (bShowDebugChainLines)
 		{
-			const FVector SecondaryLocation = SecondaryTarget->GetActorLocation();
 			const FColor LineColor = bSecondaryIsAlly ? FColor::Green : FColor::Red;
 
 			DrawDebugLine(
 				World,
 				ImpactPoint,
-				SecondaryLocation,
+				SecondaryTarget->GetActorLocation(),
 				LineColor,
 				false,
 				DebugLineDuration,
@@ -158,16 +189,95 @@ void UGA_Rima_PrimaryFire::ProcessChainTargets(AActor* PrimaryTarget, AActor* Av
 void UGA_Rima_PrimaryFire::ProcessHitResult(const FHitResult& Hit, AActor* AvatarActor)
 {
 	AActor* HitActor = Hit.GetActor();
+
 	if (!HitActor || !AvatarActor)
 	{
 		return;
 	}
 
+	UAbilitySystemComponent* HitASC =
+		UAbilitySystemBlueprintLibrary::GetAbilitySystemComponent(HitActor);
+
+	if (!HitASC)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("RIMA: Hit actor %s has no ASC"), *GetNameSafe(HitActor));
+		return;
+	}
+
 	const bool bTargetIsAlly = IsTargetAlly(HitActor, AvatarActor);
+
 	const float Magnitude = bTargetIsAlly
 		? RollRandomInRange(MinAllyHeal, MaxAllyHeal)
 		: RollRandomInRange(MinEnemyDamage, MaxEnemyDamage);
 
 	ApplyEffectToTarget(HitActor, bTargetIsAlly, Magnitude);
-	ProcessChainTargets(HitActor, AvatarActor, Hit.ImpactPoint, bTargetIsAlly, Magnitude);
+
+	ProcessChainTargets(
+		HitActor,
+		AvatarActor,
+		Hit.ImpactPoint,
+		bTargetIsAlly,
+		Magnitude
+	);
+}
+
+void UGA_Rima_PrimaryFire::ActivateAbility(
+	const FGameplayAbilitySpecHandle Handle,
+	const FGameplayAbilityActorInfo* ActorInfo,
+	const FGameplayAbilityActivationInfo ActivationInfo,
+	const FGameplayEventData* TriggerEventData)
+{
+	Super::ActivateAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
+
+	if (!K2_HasAuthority())
+	{
+		return;
+	}
+
+	AActor* AvatarActor = GetAvatarActorFromActorInfo();
+	APawn* AvatarPawn = Cast<APawn>(AvatarActor);
+
+	if (!AvatarActor || !AvatarPawn)
+	{
+		return;
+	}
+
+	ULyraRangedWeaponInstance* WeaponInstance = GetWeaponInstance();
+
+	if (!WeaponInstance)
+	{
+		return;
+	}
+
+	const FTransform AimTransform =
+		GetTargetingTransform(AvatarPawn, ELyraAbilityTargetingSource::WeaponTowardsFocus);
+
+	const FVector StartTrace = AimTransform.GetTranslation();
+	const FVector AimDir = AimTransform.GetUnitAxis(EAxis::X);
+	const float Range = WeaponInstance->GetMaxDamageRange();
+	const FVector EndTrace = StartTrace + AimDir * Range;
+
+	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(RimaPrimaryFire), true, AvatarActor);
+	AddAdditionalTraceIgnoreActors(QueryParams);
+
+	const ECollisionChannel TraceChannel = DetermineTraceChannel(QueryParams, false);
+
+	FHitResult Hit;
+	const bool bHit = GetWorld()->LineTraceSingleByChannel(
+		Hit,
+		StartTrace,
+		EndTrace,
+		TraceChannel,
+		QueryParams
+	);
+
+	UE_LOG(LogTemp, Warning, TEXT("RIMA: ActivateAbility bHit=%d HitActor=%s Range=%.1f"),
+		bHit ? 1 : 0,
+		bHit ? *GetNameSafe(Hit.GetActor()) : TEXT("NULL"),
+		Range);
+
+	if (bHit)
+	{
+		ProcessHitResult(Hit, AvatarActor);
+	}
 }
